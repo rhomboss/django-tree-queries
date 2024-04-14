@@ -48,6 +48,24 @@ class TreeQuerySet(models.QuerySet):
         self.query.sibling_order = order_by
         return self
 
+    def pre_filter(self, **filter):
+        """
+        Sets TreeQuery pre_filter attribute
+        """
+        self.query.__class__ = TreeQuery
+        filter_tuple = (True, filter)
+        self.query.pre_filter.append(filter_tuple)
+        return self
+    
+    def pre_exclude(self, **filter):
+        """
+        Sets TreeQuery pre_filter attribute
+        """
+        self.query.__class__ = TreeQuery
+        exclude_tuple = (False, filter)
+        self.query.pre_filter.append(exclude_tuple)
+        return self
+
     def as_manager(cls, *, with_tree_fields=False):  # noqa: N805
         manager_class = TreeManager.from_queryset(cls)
         # Only used in deconstruct:
