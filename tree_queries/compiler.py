@@ -12,12 +12,34 @@ def _find_tree_model(cls):
 
 
 class TreeQuery(Query):
-    # Set by TreeQuerySet.order_siblings_by
-    sibling_order = None
-    # Set by TreeQuerySet.pre_filter. A list of tuples (bool, dict)
-    # where the bool indicates filter(True) or exculde(False) and
-    # the dict contains the filter fields
-    pre_filter = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._setup_query()
+
+    def _setup_query(self):
+        """
+        Run on initialization and at the end of chaining. Any attributes that
+        would normally be set in __init__() should go here instead.
+        """
+        # We add the variables for `sibling_order` and `pre_filter` here so they
+        # act as instance variables which do not persist between user queries
+        # the way class variables do
+
+        # Only add the sibling_order attribute if the query doesn't already have one to preserve cloning behavior
+        if not hasattr(self, "sibling_order"):
+            # Add an attribute to control the ordering of siblings within trees
+            opts = _find_tree_model(self.model)._meta
+            self.sibling_order = (
+                opts.ordering
+                if opts.ordering
+                else opts.pk.attname
+            )
+
+        # Only add the pre_filter attribute if the query doesn't already have one to preserve cloning behavior
+        if not hasattr(self, "pre_filter"):
+            self.pre_filter = []
+
 
     def get_compiler(self, using=None, connection=None, **kwargs):
         # Copied from django/db/models/sql/query.py
@@ -32,12 +54,7 @@ class TreeQuery(Query):
         return TreeCompiler(self, connection, using, **kwargs)
 
     def get_sibling_order(self):
-        if self.sibling_order is not None:
-            return self.sibling_order
-        opts = _find_tree_model(self.model)._meta
-        if opts.ordering:
-            return opts.ordering
-        return opts.pk.attname
+        return self.sibling_order
 
     def get_pre_filter(self):
         return self.pre_filter
@@ -203,7 +220,8 @@ class TreeCompiler(SQLCompiler):
             return {"pre_filter": ""}
         
         # Use Django to make a SQL query whose 'WHERE' can be repurposed for __rank_table
-        base_query = _find_tree_model(self.query.model).objects.only("pk", "parent")
+        base_query = _find_tree_model(self.query.model).objects.only("pk", "parent").order_by()
+
         # Apply filters and excludes to the query in the order provided by the user
         for is_filter, filter_fields in pre_filter:
             if is_filter:
@@ -211,11 +229,12 @@ class TreeCompiler(SQLCompiler):
             else:
                 base_query = base_query.exclude(**filter_fields)
         base_query = base_query.query
-        
-        # Use the base compiler because we want vanilla sql and want to avoid recursion.
-        base_compiler = SQLCompiler(base_query, self.connection, None)
-        base_sql, base_params = base_compiler.as_sql()
-        result_sql = base_sql % base_params
+
+        # Use explain to get correct parameter substitution
+        cursor = self.connection.cursor()
+        sql, params = base_query.sql_with_params()
+        cursor.execute('EXPLAIN '+ sql, params)
+        result_sql = cursor.db.ops.last_executed_query(cursor, sql, params)
 
         # Split the base SQL string on the SQL keyword 'WHERE'
         where_split = result_sql.split("WHERE")
