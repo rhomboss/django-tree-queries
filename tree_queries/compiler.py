@@ -14,6 +14,10 @@ def _find_tree_model(cls):
 class TreeQuery(Query):
     # Set by TreeQuerySet.order_siblings_by
     sibling_order = None
+    # Set by TreeQuerySet.pre_filter. A list of tuples (bool, dict)
+    # where the bool indicates filter(True) or exculde(False) and
+    # the dict contains the filter fields
+    pre_filter = []
 
     def get_compiler(self, using=None, connection=None, **kwargs):
         # Copied from django/db/models/sql/query.py
@@ -35,6 +39,8 @@ class TreeQuery(Query):
             return opts.ordering
         return opts.pk.attname
 
+    def get_pre_filter(self):
+        return self.pre_filter
 
 class TreeCompiler(SQLCompiler):
     CTE_POSTGRESQL = """
@@ -48,6 +54,7 @@ class TreeCompiler(SQLCompiler):
             {rank_parent},
             ROW_NUMBER() OVER (ORDER BY {rank_order_by})
         FROM {rank_from}
+        {pre_filter}
     ),
     __tree (
         "tree_depth",
@@ -82,6 +89,7 @@ class TreeCompiler(SQLCompiler):
             {rank_parent},
             ROW_NUMBER() OVER (ORDER BY {rank_order_by})
         FROM {rank_from}
+        {pre_filter}
     ),
     __tree(tree_depth, tree_path, tree_ordering, tree_pk) AS (
         SELECT
@@ -113,6 +121,7 @@ class TreeCompiler(SQLCompiler):
             {rank_parent},
             row_number() OVER (ORDER BY {rank_order_by})
         FROM {rank_from}
+        {pre_filter}
     ),
     __tree(tree_depth, tree_path, tree_ordering, tree_pk) AS (
         SELECT
@@ -186,6 +195,34 @@ class TreeCompiler(SQLCompiler):
 
         return ordering_params
 
+    def get_pre_filter_params(self):
+        pre_filter = self.query.get_pre_filter()
+
+        # If there are no filters to apply return a dict with an empty pre-filter
+        if not pre_filter:
+            return {"pre_filter": ""}
+        
+        # Use Django to make a SQL query whose 'WHERE' can be repurposed for __rank_table
+        base_query = _find_tree_model(self.query.model).objects.only("pk", "parent")
+        # Apply filters and excludes to the query in the order provided by the user
+        for is_filter, filter_fields in pre_filter:
+            if is_filter:
+                base_query = base_query.filter(**filter_fields)
+            else:
+                base_query = base_query.exclude(**filter_fields)
+        base_query = base_query.query
+        
+        # Use the base compiler because we want vanilla sql and want to avoid recursion.
+        base_compiler = SQLCompiler(base_query, self.connection, None)
+        base_sql, base_params = base_compiler.as_sql()
+        result_sql = base_sql % base_params
+
+        # Split the base SQL string on the SQL keyword 'WHERE'
+        where_split = result_sql.split("WHERE")
+
+        # Return the full 'WHERE' clause
+        return {"pre_filter": f"WHERE{where_split[1]}"}
+
     def as_sql(self, *args, **kwargs):
         # Try detecting if we're used in a EXISTS(1 as "a") subquery like
         # Django's sql.Query.exists() generates. If we detect such a query
@@ -231,6 +268,9 @@ class TreeCompiler(SQLCompiler):
 
         # Add ordering params to params
         params.update(self.get_sibling_order_params())
+
+        # Add pre-filtering params to params
+        params.update(self.get_pre_filter_params())
 
         if "__tree" not in self.query.extra_tables:  # pragma: no branch - unlikely
             tree_params = params.copy()
