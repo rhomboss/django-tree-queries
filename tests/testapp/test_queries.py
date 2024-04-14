@@ -753,3 +753,46 @@ class Test(TestCase):
                 tree.child2_2,
             ],
         )
+
+    def test_pre_exclude(self):
+        tree = self.create_tree()
+        # Pre-filter should remove children if
+        # the parent meets the filtering criteria
+        nodes = Model.objects.pre_exclude(name="2")
+        self.assertEqual(
+            list(nodes),
+            [
+                tree.root,
+                tree.child1,
+                tree.child1_1,
+            ],
+        )
+
+    def test_pre_filter(self):
+        tree = self.create_tree()
+        # Pre-filter should remove children if
+        # the parent does not meet the filtering criteria
+        nodes = Model.objects.pre_filter(name__in=["root","1-1","2","2-1","2-2"])
+        self.assertEqual(
+            list(nodes),
+            [
+                tree.root,
+                tree.child2,
+                tree.child2_1,
+                tree.child2_2,
+            ],
+        )
+
+    def test_pre_filter_chaining(self):
+        tree = self.create_tree()
+        # Pre-filter should remove children if
+        # the parent does not meet the filtering criteria
+        nodes = Model.objects.pre_exclude(name="2-2").pre_filter(name__in=["root","1-1","2","2-1","2-2"])
+        self.assertEqual(
+            list(nodes),
+            [
+                tree.root,
+                tree.child2,
+                tree.child2_1,
+            ],
+        )
