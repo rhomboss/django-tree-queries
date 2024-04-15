@@ -198,19 +198,12 @@ class TreeCompiler(SQLCompiler):
         # Apply sibling_order
         base_query = base_query.order_by(*order_fields).query
 
-        # Use last_executed_query to get correct parameter substitution
-        # See: https://code.djangoproject.com/ticket/17741#comment:4
-        # Use the base Django SQLCompiler because we want to avoid recursion
-        # inside the TreeCompiler.
+        # Get SQL and parameters
         base_compiler = SQLCompiler(base_query, self.connection, None)
         base_sql, base_params = base_compiler.as_sql()
-        # cursor = self.connection.cursor()
-        with self.connection.cursor() as cursor:
-            cursor.execute('EXPLAIN '+ base_sql, base_params)
-            result_sql = cursor.db.ops.last_executed_query(cursor, base_sql, base_params)
 
         # Split sql on the last ORDER BY to get the rank_order param
-        head, sep, tail = result_sql.rpartition("ORDER BY")
+        head, sep, tail = base_sql.rpartition("ORDER BY")
 
         # Add rank_order_by to params
         rank_table_params = {
@@ -236,89 +229,7 @@ class TreeCompiler(SQLCompiler):
             else:
                 rank_table_params["rank_pk"] = field.strip()
 
-        return rank_table_params
-
-    def get_sibling_order_params(self):
-        """
-        This method uses a simple django queryset to generate sql
-        that can be used to create the __rank_table that orders
-        siblings. This is done so that any joins required by order_by
-        are pre-calculated by django
-        """
-        sibling_order = self.query.get_sibling_order()
-
-        if isinstance(sibling_order, (list, tuple)):
-            order_fields = sibling_order
-        elif isinstance(sibling_order, str):
-            order_fields = [sibling_order]
-        else:
-            raise ValueError(
-                "Sibling order must be a string or a list or tuple of strings."
-            )
-
-        # Use Django to make a SQL query whose parts can be repurposed for __rank_table
-        base_query = (
-            _find_tree_model(self.query.model)
-            .objects.only("pk", "parent")
-            .order_by(*order_fields)
-            .query
-        )
-
-        # Use the base compiler because we want vanilla sql and want to avoid recursion.
-        base_compiler = SQLCompiler(base_query, self.connection, None)
-        base_sql, base_params = base_compiler.as_sql()
-        result_sql = base_sql % base_params
-
-        # Split the base SQL string on the SQL keywords 'FROM' and 'ORDER BY'
-        from_split = result_sql.split("FROM")
-        order_split = from_split[1].split("ORDER BY")
-
-        # Identify the FROM and ORDER BY parts of the base SQL
-        ordering_params = {
-            "rank_from": order_split[0].strip(),
-            "rank_order_by": order_split[1].strip(),
-        }
-
-        # Identify the primary key field and parent_id field from the SELECT section
-        base_select = from_split[0][6:]
-        for field in base_select.split(","):
-            if "parent_id" in field:  # XXX Taking advantage of Hardcoded.
-                ordering_params["rank_parent"] = field.strip()
-            else:
-                ordering_params["rank_pk"] = field.strip()
-
-        return ordering_params
-
-    def get_pre_filter_params(self):
-        pre_filter = self.query.get_pre_filter()
-
-        # If there are no filters to apply return a dict with an empty pre-filter
-        if not pre_filter:
-            return {"pre_filter": ""}
-        
-        # Use Django to make a SQL query whose 'WHERE' can be repurposed for __rank_table
-        base_query = _find_tree_model(self.query.model).objects.only("pk", "parent").order_by()
-
-        # Apply filters and excludes to the query in the order provided by the user
-        for is_filter, filter_fields in pre_filter:
-            if is_filter:
-                base_query = base_query.filter(**filter_fields)
-            else:
-                base_query = base_query.exclude(**filter_fields)
-        base_query = base_query.query
-
-        # Use EXPLAIN query to get correct parameter substitution
-        # Copied from https://code.djangoproject.com/ticket/17741#comment:4
-        cursor = self.connection.cursor()
-        sql, params = base_query.sql_with_params()
-        cursor.execute('EXPLAIN '+ sql, params)
-        result_sql = cursor.db.ops.last_executed_query(cursor, sql, params)
-
-        # Split the base SQL string on the SQL keyword 'WHERE'
-        where_split = result_sql.split("WHERE")
-
-        # Return the full 'WHERE' clause
-        return {"pre_filter": f"WHERE{where_split[1]}"}
+        return rank_table_params, base_params
 
     def as_sql(self, *args, **kwargs):
         # Try detecting if we're used in a EXISTS(1 as "a") subquery like
@@ -363,14 +274,9 @@ class TreeCompiler(SQLCompiler):
             "sep": SEPARATOR,
         }
 
-        # Add ordering params to params
-        # params.update(self.get_sibling_order_params())
-
-        # Add pre-filtering params to params
-        # params.update(self.get_pre_filter_params())
-
-        # Check new params
-        params.update(self.get_rank_table_params())
+        # Get params needed by the rank_table
+        rank_table_params, rank_table_sql_params = self.get_rank_table_params()
+        params.update(rank_table_params)
 
         if "__tree" not in self.query.extra_tables:  # pragma: no branch - unlikely
             tree_params = params.copy()
@@ -420,7 +326,9 @@ class TreeCompiler(SQLCompiler):
         if sql_0.startswith("EXPLAIN "):
             explain, sql_0 = sql_0.split(" ", 1)
 
-        return ("".join([explain, cte.format(**params), sql_0]), sql_1)
+        # Pass any additional rank table sql paramaters so that the db backend can handle them.
+        # This only works because we know that the CTE is at the start of the query.
+        return ("".join([explain, cte.format(**params), sql_0]), rank_table_sql_params + sql_1)
 
     def get_converters(self, expressions):
         converters = super().get_converters(expressions)
