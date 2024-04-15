@@ -161,6 +161,83 @@ class TreeCompiler(SQLCompiler):
     )
     """
 
+    def get_rank_table_params(self):
+        """
+        This method uses a simple django queryset to generate sql
+        that can be used to create the __rank_table that pre-filters
+        and orders siblings. This is done so that any joins required
+        by order_by or filter/exclude are pre-calculated by django
+        """
+        # Get can validate sibling_order
+        sibling_order = self.query.get_sibling_order()
+
+        if isinstance(sibling_order, (list, tuple)):
+            order_fields = sibling_order
+        elif isinstance(sibling_order, str):
+            order_fields = [sibling_order]
+        else:
+            raise ValueError(
+                "Sibling order must be a string or a list or tuple of strings."
+            )
+        
+        # Get pre_filter
+        pre_filter = self.query.get_pre_filter()
+
+        # Use Django to make a SQL query that can be repurposed for __rank_table
+        base_query = _find_tree_model(self.query.model).objects.only("pk", "parent")
+
+        # Add pre_filters if they exist
+        if pre_filter:
+            # Apply filters and excludes to the query in the order provided by the user
+            for is_filter, filter_fields in pre_filter:
+                if is_filter:
+                    base_query = base_query.filter(**filter_fields)
+                else:
+                    base_query = base_query.exclude(**filter_fields)
+
+        # Apply sibling_order
+        base_query = base_query.order_by(*order_fields).query
+
+        # Use last_executed_query to get correct parameter substitution
+        # See: https://code.djangoproject.com/ticket/17741#comment:4
+        # Use the base Django SQLCompiler because we want to avoid recursion
+        # inside the TreeCompiler.
+        base_compiler = SQLCompiler(base_query, self.connection, None)
+        base_sql, base_params = base_compiler.as_sql()
+        # cursor = self.connection.cursor()
+        with self.connection.cursor() as cursor:
+            # cursor.execute('EXPLAIN '+ base_sql, base_params)
+            result_sql = cursor.db.ops.last_executed_query(cursor, base_sql, base_params)
+
+        # Split sql on the last ORDER BY to get the rank_order param
+        head, sep, tail = result_sql.rpartition("ORDER BY")
+
+        # Add rank_order_by to params
+        rank_table_params = {
+            "rank_order_by": tail.strip(),
+        }
+
+        # Split on the first WHERE if present to get the pre_filter param
+        if pre_filter:
+            head, sep, tail = head.partition("WHERE")
+            rank_table_params["pre_filter"] = "WHERE " + tail.strip() # Note the space after WHERE
+        else:
+            rank_table_params["pre_filter"] = ""
+
+        # Split on the first FROM to get any joins etc.
+        head, sep, tail = head.partition("FROM")
+        rank_table_params["rank_from"] = tail.strip()
+
+        # Identify the parent and primary key fields
+        base_select = head[6:]
+        for field in base_select.split(","):
+            if "parent_id" in field:  # XXX Taking advantage of Hardcoded.
+                rank_table_params["rank_parent"] = field.strip()
+            else:
+                rank_table_params["rank_pk"] = field.strip()
+
+        return rank_table_params
+
     def get_sibling_order_params(self):
         """
         This method uses a simple django queryset to generate sql
@@ -230,7 +307,8 @@ class TreeCompiler(SQLCompiler):
                 base_query = base_query.exclude(**filter_fields)
         base_query = base_query.query
 
-        # Use explain to get correct parameter substitution
+        # Use EXPLAIN query to get correct parameter substitution
+        # Copied from https://code.djangoproject.com/ticket/17741#comment:4
         cursor = self.connection.cursor()
         sql, params = base_query.sql_with_params()
         cursor.execute('EXPLAIN '+ sql, params)
@@ -286,10 +364,13 @@ class TreeCompiler(SQLCompiler):
         }
 
         # Add ordering params to params
-        params.update(self.get_sibling_order_params())
+        # params.update(self.get_sibling_order_params())
 
         # Add pre-filtering params to params
-        params.update(self.get_pre_filter_params())
+        # params.update(self.get_pre_filter_params())
+
+        # Check new params
+        params.update(self.get_rank_table_params())
 
         if "__tree" not in self.query.extra_tables:  # pragma: no branch - unlikely
             tree_params = params.copy()
