@@ -206,7 +206,7 @@ class TreeCompiler(SQLCompiler):
         base_sql, base_params = base_compiler.as_sql()
         # cursor = self.connection.cursor()
         with self.connection.cursor() as cursor:
-            # cursor.execute('EXPLAIN '+ base_sql, base_params)
+            cursor.execute('EXPLAIN '+ base_sql, base_params)
             result_sql = cursor.db.ops.last_executed_query(cursor, base_sql, base_params)
 
         # Split sql on the last ORDER BY to get the rank_order param
@@ -229,8 +229,8 @@ class TreeCompiler(SQLCompiler):
         rank_table_params["rank_from"] = tail.strip()
 
         # Identify the parent and primary key fields
-        base_select = head[6:]
-        for field in base_select.split(","):
+        head, sep, tail = head.partition("SELECT")
+        for field in tail.split(","):
             if "parent_id" in field:  # XXX Taking advantage of Hardcoded.
                 rank_table_params["rank_parent"] = field.strip()
             else:
